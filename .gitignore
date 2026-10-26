@@ -21,3 +21,24 @@ outputs/
 # Local-only blog/experiment notes
 docs/
 CLAUDE.md
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+.huggingface/
+.cache/
+.aws/
+*.pem
+*.key
+
+# Generated textures and geometry sidecars (keep input images in assets/)
+*_basecolor.png
+*.mtl
+
+# Python build and tool artifacts
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+*.pyo

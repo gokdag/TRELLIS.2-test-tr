@@ -75,9 +75,17 @@ fi
 if [ ! -d ".venv" ]; then
     echo "Creating virtual environment..."
     if command -v uv &>/dev/null; then
-        uv venv .venv --python python3.11
+        uv venv .venv --python 3.11
     else
-        python3 -m venv .venv
+        # Prefer the documented Python version even when macOS's default
+        # python3 still points to an older Command Line Tools installation.
+        if command -v python3.11 &>/dev/null; then
+            PYTHON_BIN=python3.11
+        else
+            PYTHON_BIN=python3
+        fi
+        "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "Python 3.11 or newer is required. Install Python 3.11 and retry.")'
+        "$PYTHON_BIN" -m venv .venv
     fi
 fi
 
@@ -136,11 +144,13 @@ python3 -m trellis_silicon.patches
 # Check HuggingFace auth
 echo
 if python3 -c "from huggingface_hub import get_token; assert get_token()" 2>/dev/null; then
-    echo "HuggingFace auth: OK"
+    echo "HuggingFace token: found (model access is checked on first generation)"
 else
     echo "WARNING: Not logged into HuggingFace."
     echo "Some model weights require authentication. Run:"
+    echo "  source .venv/bin/activate"
     echo "  hf auth login"
+    echo "  hf auth whoami"
     echo ""
     echo "You also need to request access to these gated models:"
     echo "  https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"

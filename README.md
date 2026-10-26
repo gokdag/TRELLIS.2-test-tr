@@ -1,294 +1,264 @@
 # TRELLIS-Silicon
 
-Run [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) image-to-3D generation natively on Apple Silicon — no NVIDIA GPU required.
-
-TRELLIS.2 is Microsoft Research's state-of-the-art image-to-3D model. It ships CUDA-only. This project runs it on Apple Silicon through PyTorch's MPS backend: a single image in, a textured 400K+-vertex GLB out, entirely on your Mac's GPU.
+Apple Silicon işlemcili Mac üzerinde tek bir görselden 3D model üretir. [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) modelini PyTorch MPS ile çalıştırır ve sonucu dokulu **GLB** dosyası olarak kaydeder. Terminalden veya yerel web arayüzünden kullanılabilir.
 
 <p align="center">
-<img src="assets/demo.gif" width="720" alt="Input image and the generated 3D mesh rotating on a turntable">
+  <img src="assets/demo.gif" width="720" alt="Girdi görseli ve üretilen 3D model">
 </p>
 
-## TL;DR
+Bu sürüm, [Sanchez Kim'in TRELLIS-Silicon projesi](https://github.com/sanchez-kim/trellis-silicon) üzerine kuruludur. Kaynak projelerin atıfları ve MIT lisansı korunur. Ayrıntılı teknik açıklamalar ve kaynak projenin performans ölçümleri için [İngilizce README](README.en.md) dosyasına bakabilirsiniz.
 
-- **One command**: `trellis-silicon photo.png` → GLB with baked PBR textures. Web UI: `trellis-silicon-web`.
-- **Fast**: warm runs take **~19s load + ~2.5-3 min generation** (default `512` pipeline). The performance pass over the base port cut load **5×** (~103s → ~19s) and total warm time **~37%** (~300s → ~190s); `--steps 8` fast mode lands near ~140s with almost no visible quality loss.
-- **Where the speed came from** (measured, not guessed): skipping a weight init that gets overwritten anyway, loading only the checkpoints the pipeline uses, batching the two CFG forwards, swapping MPS SDPA for a naive attention that is 3.3-3.9× faster at these shapes, and vectorizing mesh extraction (67×). Full story in [Performance](#performance) — including five intuitive optimizations that measurement killed.
-- **Quality is tunable**: defaults favor speed; `--pipeline-type 1024_cascade --texture-size 2048` plus `BAKE_MAX_FACES=800000` for maximum quality (see [Maximum quality](#maximum-quality)).
-- **Reproducible**: pinned upstream commit, locked dependencies, deterministic verification gate, tests + CI on Apple Silicon runners.
+## 1. Önce hangi hesaplar ve girişler gerekiyor?
 
-## Quickstart
+| Hizmet | Gerekli mi? | Ne için kullanılır? |
+| --- | --- | --- |
+| **Hugging Face** | **Evet** | Erişim izni isteyen model dosyalarını indirmek için. |
+| **GitHub** | Yalnızca projeyi kendi hesabınızda yayımlamak için | Herkese açık depoyu indirmek ve yerelde çalıştırmak için giriş gerekmez. |
+| **Yerel web arayüzü (Gradio)** | Hayır | Mac üzerinde açılır; ayrı kayıt veya giriş istemez. |
 
-```bash
-git clone https://github.com/sanchez-kim/trellis-silicon.git && cd trellis-silicon
-xcodebuild -downloadComponent MetalToolchain  # optional: Metal-accelerated texture baker
-hf auth login                                 # gated weights — approve DINOv3 + RMBG-2.0 on HF first
-bash setup.sh && source .venv/bin/activate
-trellis-silicon photo.png                     # → photo.glb (first run downloads ~15GB of weights)
-```
+### Hugging Face hesabı ve model izinleri
 
-Requires macOS on Apple Silicon (M1+), Python 3.11+, 24GB+ unified memory recommended. Details, gated-model links, and troubleshooting in [Installation](#installation).
+Üretime başlamadan önce şu adımları tamamlayın:
 
----
+1. [Hugging Face hesabı oluşturun](https://huggingface.co/join) veya [giriş yapın](https://huggingface.co/login).
+2. Aynı hesap açıkken aşağıdaki iki model sayfasını ziyaret edin. Gösterilen koşulları okuyup kabul edin, istenen formu doldurun ve erişim isteğini gönderin.
+   - [DINOv3 — facebook/dinov3-vitl16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m): görsel özelliklerini çıkarmak için kullanılır.
+   - [RMBG-2.0 — briaai/RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0): arka planı kaldırmak için kullanılır.
+3. Her iki model için erişimin açıldığından emin olun. İstek beklemedeyse onaylanmadan üretime geçmeyin. Yalnızca hesap açmak yeterli değildir.
+4. Aşağıdaki kurulumu bitirdikten sonra terminalde `hf auth login` ile **erişim izni verilen aynı hesaba** giriş yapın.
 
-This project builds on [trellis-mac](https://github.com/shivampkumar/trellis-mac) by Shivam P Kumar — the original CUDA-to-Apple-Silicon port — and continues independently, packaged as an installable Python project with an additional performance pass.
+Komut tarayıcı üzerinden giriş sunarsa o akışı tamamlayabilirsiniz. Token istenirse [Access Tokens](https://huggingface.co/settings/tokens) sayfasından **Read** yetkili bir token oluşturun ve giriş istemine yapıştırın. Model indirmek için Write yetkisi gerekmez. Git kimlik bilgilerine ekleme sorulursa `n` seçebilirsiniz.
 
-## Example
+Token'ı README'ye, kaynak koda veya GitHub'a eklemeyin. Bu proje için `.env` oluşturmanız gerekmez; `hf auth login` giriş bilgisini yerel Hugging Face önbelleğinde saklar.
 
-From a single image, TRELLIS-Silicon generates a **400K+ vertex mesh with baked PBR textures** (base color, metallic, roughness) as a ready-to-use GLB.
+> Model izinleri, terminal girişi ve model lisansı ayrı konulardır. RMBG-2.0 model sayfası ticari olmayan kullanım için erişim sunar; ticari kullanım için BRIA'nın lisans koşullarını inceleyin. Kodun MIT lisansı model ağırlıklarının koşullarını değiştirmez.
 
-**Input image** &rarr; **Generated 3D mesh** (~500K vertices, ~1M triangles) with Metal-baked PBR textures:
+Resmî açıklamalar: [Hugging Face giriş komutları](https://huggingface.co/docs/huggingface_hub/guides/cli), [token yetkileri](https://huggingface.co/docs/hub/security-tokens), [model erişim izinleri](https://huggingface.co/docs/hub/models-gated).
 
-<p>
-<img src="assets/brighella_input.png" width="200">
-<img src="assets/brighella_front.png" width="200">
-<img src="assets/brighella_3q.png" width="200">
-<img src="assets/brighella_side.png" width="200">
-</p>
+## 2. Sistem gereksinimleri
 
-*Sample image: ["Brighella on a pedestal"](https://www.metmuseum.org/art/collection/search/201769) (1710-13), The Metropolitan Museum of Art — public domain (CC0).*
+- **Apple Silicon Mac:** M1 veya daha yeni işlemci ve MPS destekli macOS. Bu kurulum Intel Mac, Windows veya Linux için hazırlanmadı.
+- **Python 3.11:** kilitli ortam ve CI bu sürümü kullanır. Paket Python 3.11 ve üzerini bildirir; başlangıç için 3.11 tercih edin.
+- **Bellek:** 24 GB veya üzeri birleşik bellek önerilir. 16 GB cihazlarda çalışma garantisi verilmez.
+- **Disk:** model dosyaları için yaklaşık 15 GB; Python ortamı ve derlenen bağımlılıklar için ayrıca boş alan gerekir.
+- **İnternet:** kurulum, ilk model indirmeleri ve gerektiğinde ek çözünürlüklerin ağırlıklarını indirmek için.
+- **Git ve Xcode Command Line Tools:** bağımlılıkları indirmek ve yerel uzantıları derlemek için.
 
-> Preview images in this README are rendered headless with `tools/render_preview.py`; for interactive inspection open the GLB in Blender or [gltf-viewer](https://gltf-viewer.donmccurdy.com).
+Metal hızlandırmasının kullanılabilirliği macOS ve Xcode sürümüne bağlıdır. Metal uzantıları yüklenemezse proje daha yavaş alternatif arka uçları kullanabilir.
 
-## How this differs from trellis-mac
+## 3. Kurulum
 
-[trellis-mac](https://github.com/shivampkumar/trellis-mac) proved TRELLIS.2 could run on Apple Silicon at all. This project builds on that port and focuses on making it something you can install, trust, and keep using:
+### Proje klasörünü açın
 
-- **Packaged** — a src-layout Python package with three console scripts and a Gradio web UI, instead of loose scripts.
-- **Reproducible** — TRELLIS.2 pinned to a validated upstream commit, locked Python dependencies, a deterministic verification gate (fixed seed → exact mesh counts), a unit-test suite, and CI on Apple Silicon runners.
-- **Faster** — a measurement-first performance pass: conditional checkpoint loading + skip-init (pipeline load ~103s → ~19s warm), batched classifier-free guidance (−7.8% generation), a naive dense-attention backend that beats PyTorch's MPS SDPA by 3.3-3.9× at the structure-phase shapes (−19% generation), vectorized mesh extraction (67× on that step). Warm end-to-end roughly halved overall; see [Performance](#performance).
-- **Measured, including the failures** — the optimization campaign documents its dead ends (fused varlen attention kernels, `torch.compile` on MPS, model residency) so nobody re-walks them; see [Performance](#performance).
-- **Verified beyond 512** — the `1024` and `1024_cascade` pipelines are exercised on-device, not just theoretically supported.
-
-## Requirements
-
-- macOS on Apple Silicon (M1 or later)
-- Python 3.11+
-- 24GB+ unified memory recommended (the 4B model is large); measured peak process memory on one machine (512 pipeline, default settings) was ~12-14GB, occurring during pipeline load rather than generation or baking — see [Memory](#memory) below if you're on a 16GB machine
-- ~15GB disk space for model weights (downloaded on first run)
-
-## Installation
+GitHub'daki kendi deponuzun **Code → HTTPS** adresini kopyalayarak klonlayın. Aşağıdaki yer tutucuyu kendi adresinizle değiştirin:
 
 ```bash
-git clone https://github.com/sanchez-kim/trellis-silicon.git
+git clone https://github.com/KULLANICI_ADINIZ/trellis-silicon.git
 cd trellis-silicon
-
-# (Recommended) Download the Xcode Metal Toolchain so setup can build the
-# Metal-accelerated texture baker. Without it, setup falls back to a pure-Python
-# KDTree baker (slower, slightly softer near UV seams).
-xcodebuild -downloadComponent MetalToolchain
-
-# Log into HuggingFace (needed for the gated model weights)
-hf auth login
-
-# Request access to these gated models (usually instant approval):
-#   https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
-#   https://huggingface.co/briaai/RMBG-2.0
-
-# Set up everything: create the venv, editable-install the package, clone &
-# patch TRELLIS.2, and build the Metal backends when the toolchain is present.
-bash setup.sh
-
-source .venv/bin/activate
 ```
 
-`setup.sh` does an editable install (`uv pip install -e .`), which registers the `trellis-silicon`, `trellis-silicon-web`, and `trellis-silicon-patch` commands.
+Depo adı farklıysa `cd` komutunda o klasörün adını kullanın. ZIP indirdiyseniz ZIP'i açıp `setup.sh` dosyasının bulunduğu klasörde terminal açmanız yeterlidir.
 
-To skip the Metal build (older hardware, or a faster setup):
+Mevcut çalışma klasörünüz `3d-model-generator` ise asıl proje bir alt klasördedir:
+
+```bash
+cd trellis-silicon
+```
+
+### Geliştirme araçlarını kontrol edin
+
+```bash
+xcode-select --install
+python3.11 --version
+```
+
+Command Line Tools zaten kuruluysa ilk komutu tekrar çalıştırmanız gerekmez. `python3.11` bulunamazsa Python 3.11'i kurup terminali yeniden açın. `uv` kuruluysa kurulum betiği Python ortamını onunla oluşturur; `uv` hesabı veya girişi gerekmez.
+
+Metal ile daha hızlı doku işleme için uygun Xcode kurulumunda şu bileşeni indirebilirsiniz:
+
+```bash
+xcodebuild -downloadComponent MetalToolchain
+```
+
+Bu komut mevcut Xcode kurulumunuzda desteklenmiyorsa aşağıdaki Metal'siz kurulum seçeneğini kullanabilirsiniz.
+
+### Ortamı kurun, ardından giriş yapın
+
+```bash
+bash setup.sh
+source .venv/bin/activate
+hf auth login
+hf auth whoami
+```
+
+`hf` komutu proje bağımlılıklarıyla kurulur; bu yüzden terminal girişi **kurulumdan sonra** yapılır. `setup.sh` sonunda giriş yapılmadığına dair uyarı görmeniz ilk kurulumda normaldir. `hf auth whoami` beklediğiniz hesabı göstermelidir; model izinlerini ayrıca iki model sayfasından kontrol edin.
+
+Betik `.venv/` ortamını oluşturur, `requirements.lock` bağımlılıklarını kurar, kaynak bağımlılıkları `deps/` ve `TRELLIS.2/` içine indirir, Apple Silicon uyumluluk yamalarını uygular ve terminal komutlarını kaydeder. Model ağırlıkları ilk üretimde indirilir.
+
+**Metal uzantılarını derlemeden kurmak için** yukarıdaki `bash setup.sh` yerine:
 
 ```bash
 SKIP_METAL=1 bash setup.sh
 ```
 
-`setup.sh` pre-clones its Git dependencies into `deps/` so all network I/O happens up front. If local clone state looks inconsistent, remove `deps/` and re-run:
+Diğer adımlar aynıdır. Doku işleme daha yavaş olabilir.
+
+## 4. Terminalden kullanım
+
+Aşağıdaki komutları proje kökünde, yani `setup.sh` ve `assets/` klasörünün bulunduğu yerde çalıştırın. Her yeni terminalde önce ortamı etkinleştirin:
 
 ```bash
-rm -rf deps && bash setup.sh
+source .venv/bin/activate
 ```
 
-## Usage
+### İlk örnek: vi.png
 
 ```bash
-# Basic
-trellis-silicon photo.png
-
-# With options
-trellis-silicon photo.png --seed 123 --output my_model --pipeline-type 512
-
-# All options
-trellis-silicon --help
+trellis-silicon ./assets/vi.png
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--seed` | `42` | Random seed for generation |
-| `--output` | `output_3d` | Output filename (without extension) |
-| `--pipeline-type` | `512` | Pipeline resolution: `512`, `1024`, `1024_cascade` |
-| `--texture-size` | `1024` | PBR texture resolution: `512`, `1024`, `2048` |
-| `--steps N` | pipeline JSON (usually 12) | Override sampler steps for all three flow phases |
-| `--no-texture` | — | Skip texture baking (still exports geometry) |
-| `--obj` | — | Also export the untextured, full-resolution OBJ (written before simplification) |
-| `--resident` | — | Keep all models resident on MPS instead of shuffling CPU↔MPS per phase. Measured slower on a 24-32GB machine (memory pressure outweighs the saved transfers); may help on 64GB+ |
+Bu komut depodaki `assets/vi.png` görselini okur ve **komutu çalıştırdığınız klasöre `output_3d.glb`** kaydeder. Çıktı adı görsel adından otomatik türetilmez. Aynı çıktı adıyla tekrar üretim yaparsanız önceki dosyanın üzerine yazılır.
 
-A GLB with baked PBR textures is the only default output; use `--obj` if you also need the untextured full-resolution mesh.
+İlk çalıştırmada model indirmeleri nedeniyle bekleme süresi uzundur. Sonraki çalıştırmalar indirilen ağırlıkları yerel önbellekten kullanır. Üretim süresi Mac'in donanımına, sıcaklığına ve seçilen ayarlara bağlıdır.
 
-### Fast mode
-
-Generation time is roughly linear in the sampler step count. Dropping from the default 12 steps to **8** cuts generation by ~39% with quality that is nearly indistinguishable; **6** steps is faster still but visibly noisier on the surface.
+### Çıktıları ayrı adlarla kaydetme
 
 ```bash
-trellis-silicon photo.png --steps 8
+mkdir -p outputs
+trellis-silicon ./assets/vi.png --output outputs/vi
+trellis-silicon ./assets/bolet.png --output outputs/bolet
+trellis-silicon ./assets/brighella_input.png --output outputs/brighella
 ```
 
-### Maximum quality
+Sonuçlar sırasıyla `outputs/vi.glb`, `outputs/bolet.glb` ve `outputs/brighella.glb` olur. `--output` değerine uzantı eklemeyin; hedef klasörü önce oluşturun. KDTree doku arka ucu kullanılırsa ek olarak `*_basecolor.png` kaydedilir.
 
-The default `512` pipeline is the speed/quality sweet spot. If you can wait, the higher-resolution pipelines produce ~4× denser raw geometry, and `--texture-size 2048` doubles the texture resolution:
+### Kendi görselinizi kullanma
 
 ```bash
-trellis-silicon photo.png --pipeline-type 1024_cascade --texture-size 2048
+trellis-silicon "/tam/yol/benim gorselim.png" --output outputs/benim_modelim
 ```
 
-| | `512` (default) | `1024` | `1024_cascade` |
-|---|---|---|---|
-| Raw mesh | ~1.0M triangles | ~4.0M | ~4.2M |
-| Wall time (warm machine, single indicative runs) | ~3.5 min | ~17 min | ~19 min |
+Boşluk içeren yolları çift tırnak içine alın. Nesnenin net ve tamamının görünür olduğu, sade arka planlı bir görselle başlayın.
 
-<p>
-<img src="assets/quality_compare.png" width="720" alt="512 default output next to 1024_cascade with 2K textures">
-</p>
-
-At default settings the GLB-level gain is mostly texture fidelity, because every mesh is decimated to 200K faces before baking. That cap is configurable:
+### Daha hızlı deneme
 
 ```bash
-# let up to 800K faces survive into the GLB (measured stable, bake +~50-90s)
-BAKE_MAX_FACES=800000 trellis-silicon photo.png --pipeline-type 1024_cascade --texture-size 2048
+trellis-silicon ./assets/vi.png --steps 8 --output outputs/vi_fast
 ```
 
-Measured on one M-series/32GB machine (512-pipeline input, 1.06M raw faces): stable at every cap tried — 400K (bake 22s), 600K (30s), 800K (91s), even the full undecimated 1.06M mesh (120s), vs 9s at the default 200K. For `1024_cascade` the difference is dramatic: with `BAKE_MAX_FACES=800000`, 730K faces survive into the GLB instead of 164K — visibly cleaner drapery and far fewer surface pits:
+Daha az örnekleme adımı süreyi azaltabilir; sonuç kalitesi değişebilir.
 
-<p>
-<img src="assets/bakecap_compare.png" width="720" alt="1024_cascade baked at the default 200K face cap next to the same generation baked at an 800K cap">
-</p>
-
-The default stays a conservative 200K until higher caps are validated on more machines (the historical "unstable above 800K" behavior of the Metal BVH builder did not reproduce here, but the evidence is one machine, single runs).
-
-Beyond that, two things still cap quality relative to the CUDA original:
-
-- **Hole filling disabled.** Decode-time hole filling needs `cumesh`, whose Metal port crashes on decoder-sized meshes; outputs may have small holes the CUDA path would close.
-- **Pre-bake decimation at default settings** — see above; `--obj` exports the full-resolution mesh regardless.
-
-### Web UI
+### Daha yüksek çözünürlük
 
 ```bash
+trellis-silicon ./assets/vi.png --pipeline-type 1024_cascade --texture-size 2048 --output outputs/vi_high
+```
+
+Bu seçenek daha fazla süre ve bellek gerektirebilir. GLB için varsayılan sadeleştirme hedefi 200.000 yüzdür. Daha fazla geometri korumak için:
+
+```bash
+BAKE_MAX_FACES=800000 trellis-silicon ./assets/vi.png --pipeline-type 1024_cascade --texture-size 2048 --output outputs/vi_detail
+```
+
+Yüksek yüz sayıları doku işleme maliyetini artırır; önce varsayılan ayarlarla başlayın.
+
+### OBJ veya dokusuz GLB
+
+```bash
+# GLB yanında tam çözünürlüklü, dokusuz OBJ de kaydet
+trellis-silicon ./assets/vi.png --obj --output outputs/vi_mesh
+
+# Doku işlemeyi atla ve yalnızca geometri içeren GLB kaydet
+trellis-silicon ./assets/vi.png --no-texture --output outputs/vi_geometry
+```
+
+### Komut seçenekleri
+
+| Seçenek | Varsayılan | Açıklama |
+| --- | --- | --- |
+| `--output` | `output_3d` | Çıktı yolu/adı; uzantısız. |
+| `--seed` | `42` | Rastgelelik tohumu. |
+| `--pipeline-type` | `512` | `512`, `1024` veya `1024_cascade`. |
+| `--texture-size` | `1024` | Doku boyutu: `512`, `1024` veya `2048`. |
+| `--steps` | Model ayarı (genellikle 12) | Üç örnekleme aşamasındaki adım sayısı. |
+| `--no-texture` | Kapalı | Doku işlemeyi atlar. |
+| `--obj` | Kapalı | Sadeleştirme öncesi geometriyi ayrıca OBJ olarak kaydeder. |
+| `--resident` | Kapalı | Modelleri MPS belleğinde tutar; bellek baskısı nedeniyle yavaşlatabilir. |
+
+Tüm seçenekler: `trellis-silicon --help`.
+
+## 5. Web arayüzü ve sonuçları açma
+
+```bash
+source .venv/bin/activate
 trellis-silicon-web
 ```
 
-Opens a local Gradio page (http://127.0.0.1:7860) where you can upload an image, adjust seed / pipeline-type / texture options, and view the generated GLB in an interactive 3D viewer. The pipeline loads lazily on the first Generate click and is cached across generations in the same process.
+Tarayıcıda **http://127.0.0.1:7860** adresini açın. Görsel yükleyin, ayarları seçin ve **Generate** düğmesine basın. İlk üretimde model yüklenir; ilerleme terminalde görünür. Aynı anda bir üretim çalışır.
 
-## Project layout
+Sonucu sayfadaki 3D görüntüleyicide inceleyebilirsiniz. Dosyalar `gradio_outputs/` klasörüne benzersiz adlarla kaydedilir. Arayüz yalnızca yerel adreste çalışır ve herkese açık paylaşım bağlantısı oluşturmaz. Durdurmak için terminalde `Ctrl+C` kullanın.
 
+GLB dosyalarını Blender'da **File → Import → glTF 2.0 (.glb/.gltf)** yoluyla da açabilirsiniz.
+
+## 6. Sık karşılaşılan sorunlar
+
+| Sorun | Yapılacak işlem |
+| --- | --- |
+| `trellis-silicon: command not found` veya `hf: command not found` | Proje klasöründe `source .venv/bin/activate` çalıştırın. Kurulum yarıda kaldıysa `bash setup.sh` komutunu yeniden çalıştırın. |
+| `401`, `403` veya `GatedRepoError` | `hf auth whoami` ile hesabı kontrol edin. İki model sayfasındaki erişim izinlerini ve token'ın okuma yetkisini doğrulayın. Gerekirse `hf auth login --force` ile yeniden giriş yapın. |
+| Görsel bulunamadı | `assets/` klasörünün bulunduğu yerde olduğunuzu ve dosya yolunu kontrol edin. |
+| Çıktı klasörü bulunamadı | Örneğin `mkdir -p outputs` çalıştırın; uygulama hedef klasörü otomatik oluşturmaz. |
+| Metal derlemesi başarısız | `SKIP_METAL=1 bash setup.sh` ile uzantı derlemesini atlayın. Zaten kurulu uzantılar bu komutla kaldırılmaz. |
+| Bellek yetersiz veya üretim çok yavaş | Diğer ağır uygulamaları kapatın, `512` çözünürlüğü kullanın ve `--resident` seçeneğini kapalı tutun. |
+| Decoder boş mesh üretti / GPU watchdog hatası | `SPARSE_CONV_BACKEND=none trellis-silicon ./assets/vi.png` ile daha yavaş alternatif yolu deneyin. |
+| `7860` portu kullanımda | Önceki `trellis-silicon-web` sürecini kendi terminalinde `Ctrl+C` ile kapatın. |
+
+Üretim yalnızca çıkarım içindir; eğitim desteği yoktur. CUDA sürümündeki bazı mesh onarma adımları devre dışıdır ve çıktıda küçük delikler oluşabilir.
+
+## 7. GitHub'a yükleme
+
+**Git deposunun kökü `trellis-silicon/` klasörüdür.** `.venv/`, `deps/`, `TRELLIS.2/`, model önbellekleri, token dosyaları ve üretilen modeller depoya eklenmez. Örnek girdi görselleri `assets/` altında kalır. `.gitignore` bu ayrımı sağlar.
+
+Bu çalışma kopyası kaynak deponun Git geçmişiyle gelir. Kendi GitHub hesabınızda boş bir depo oluşturduktan sonra mevcut uzak adresi kontrol edin:
+
+```bash
+git remote -v
 ```
-src/trellis_silicon/
-  cli.py         # trellis-silicon        — CLI entry point
-  webui.py       # trellis-silicon-web     — Gradio UI
-  core.py        # shared load + generate + bake pipeline
-  backends/      # pure-PyTorch / KDTree fallbacks for the CUDA-only libs
-  patches/       # trellis-silicon-patch   — idempotent TRELLIS.2 source patchers
-TRELLIS.2/       # upstream checkout (cloned by setup.sh, patched in place)
-tools/           # profiling + benchmark scripts
+
+`origin` hâlâ kaynak projeyi gösteriyorsa kendi adresinizle değiştirin:
+
+```bash
+git remote set-url origin https://github.com/KULLANICI_ADINIZ/trellis-silicon.git
 ```
 
-TRELLIS.2 itself is not vendored in git; `setup.sh` clones it and `trellis-silicon-patch` (`python -m trellis_silicon.patches`) rewrites its CUDA-only paths in place. Every patch is guarded by a marker string, so re-running is idempotent.
+Ardından dosyaları gözden geçirip yükleyin:
 
-## What was ported
+```bash
+git status --short
+git add .
+git diff --cached --stat
+git commit -m "docs: prepare repository for GitHub"
+git push -u origin HEAD
+```
 
-TRELLIS.2 depends on several CUDA-only libraries. Each is replaced with a backend that runs on Apple Silicon:
+`KULLANICI_ADINIZ` ve depo adını kendi bilgilerinizle değiştirin. Push aşamasında GitHub kimlik doğrulaması gerekir. GitHub hesabı ile Hugging Face hesabı birbirinden bağımsızdır. `.gitignore`, daha önce Git'e eklenmiş dosyaları otomatik olarak takipten çıkarmaz; commit öncesi eklenen dosyaları inceleyin.
 
-| Original (CUDA) | Replacement | Purpose |
-|---|---|---|
-| `flex_gemm` | `mtlgemm` (Pedro Naugusto's Metal port), with `backends/conv_none.py` fallback | Sparse 3D convolution |
-| `o_voxel._C` hashmap | `backends/mesh_extract.py` | Mesh extraction from the dual voxel grid (pure PyTorch) |
-| `flash_attn` | PyTorch SDPA (sparse path) / naive unfused (dense path) | Attention; the unfused dense path is a measured 3.3-3.9× win over MPS SDPA |
-| `cumesh` | Skipped during decode | Crashes the Metal port on decoder-sized meshes; replaced by `fast_simplification` before baking |
-| `nvdiffrast` | `mtldiffrast` (Metal), with pure-Python fallback | Differentiable rasterization for texture baking |
+## Geliştirme ve dosya yapısı
 
-All hardcoded `.cuda()` calls are patched to use the active device.
+```text
+assets/                  Örnek görseller ve dokümantasyon görselleri
+src/trellis_silicon/      CLI, web arayüzü, üretim kodu ve uyumluluk yamaları
+tests/                   Mesh çıkarımı testleri
+tools/                   Profil ve önizleme araçları
+.github/                 CI ve issue şablonları
+setup.sh                 Kurulum betiği
+requirements.lock        Sabitlenmiş Python bağımlılıkları
+```
 
-### Technical details
+Katkı kuralları ve testler: [CONTRIBUTING.md](CONTRIBUTING.md). `TRELLIS.2/` kurulumda oluşturulur; kaynak değişiklikleri `src/trellis_silicon/patches/` içindeki yamalarla yapılır.
 
-**Sparse 3D convolution** (`backends/conv_none.py`): submanifold sparse convolution via a spatial hash of active voxels — gather neighbor features per kernel position, apply weights by matmul, scatter-add back. Neighbor maps are cached per tensor.
+## Lisans ve kaynaklar
 
-**Mesh extraction** (`backends/mesh_extract.py`): reimplements `flexible_dual_grid_to_mesh` without CUDA hashmaps — the coord→index lookup is a collision-free int64 coordinate hash resolved with `torch.unique` + `searchsorted`, then connected voxels per edge and quad triangulation by normal alignment.
+Bu depodaki kod [MIT lisansı](LICENSE) ile sunulur. Model ağırlıkları ayrı koşullara tabidir: [TRELLIS.2](https://github.com/microsoft/TRELLIS.2), [DINOv3](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m), [RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0). Kendi girdi görsellerinizi ve çıktılarınızı paylaşırken ilgili kullanım haklarını da gözetin.
 
-**Attention** (patched `full_attn.py`): adds an SDPA backend to the sparse attention module. Variable-length sequences are padded into a batch, run through `torch.nn.functional.scaled_dot_product_attention`, then unpadded.
-
-**Texture baking**: by default the Metal stack from [@pedronaugusto](https://github.com/pedronaugusto) — [`mtldiffrast`](https://github.com/pedronaugusto/mtldiffrast), [`mtlbvh`](https://github.com/pedronaugusto/mtlbvh), [`mtlmesh`](https://github.com/pedronaugusto/mtlmesh), and his CPU fork of [`o_voxel`](https://github.com/pedronaugusto/trellis2-apple) — exposing `o_voxel.postprocess.to_glb`. The decoder mesh is pre-simplified to ~200K faces with `fast_simplification` before the Metal BVH (the builder is unstable on 800K+ face inputs). Without the Metal toolchain, `backends/texture_baker.py` takes over: xatlas UV unwrap, then a scipy cKDTree + inverse-distance weighting over the sparse voxel grid.
-
-## Performance
-
-This project ran a measurement-first optimization campaign on top of the base port. The adopted wins:
-
-| Optimization | Effect | Notes |
-|---|---|---|
-| Conditional checkpoint loading | load ~103s → ~55-65s | `512` pipeline skips the two unused ~2.4GB `*_1024` flow models |
-| Skip-init on load | load ~56s → **~19s** (warm) | The xavier init is immediately overwritten by `load_state_dict`; skipping it is bit-identical. Opt out with `SKIP_INIT_ON_LOAD=0` |
-| CFG batching | generation 197.3s → 181.9s (−7.8%) | The two classifier-free-guidance forwards run as one batch-2 forward; mesh is bit-identical. Opt out with `CFG_BATCH=0` |
-| Naive dense attention | structure phase ~1.75×, generation **−19%** (same-window A/B: 211.5s → ~170s) | PyTorch's fused SDPA is pathologically slow on MPS at the structure-phase shape (B=2, S=4096, H=12, D=128, bf16) — a textbook unfused `softmax(qkᵀ)v` measures 3.3–3.9× faster at both self- and cross-attention shapes, at bf16-level numerical noise. Opt out with `ATTN_BACKEND=sdpa` |
-| Naive sparse attention | shape/tex SLat sampling −38%/−44% s/it | Same finding, applied to the shape/tex SLat shapes (self-attn S=1591, cross-attn kv=1029) — naive measures ~4.0-4.1× faster than SDPA there, an even bigger win than dense. Opt out with `SPARSE_ATTN_BACKEND=sdpa` |
-| Vectorized mesh extraction | extraction step 8.8s → 0.13s | The coord→index dict loops became an int64 perfect hash + `torch.unique`; bit-identical output |
-| Step-count fast mode | generation −39% at `--steps 8` | Quality/speed tradeoff, off by default (see [fast mode](#fast-mode)) |
-
-Both load and generation optimizations are on by default and verified to leave the output mesh unchanged (or, for CFG batching, identical to floating-point rounding). Two paths we investigated and **rejected**: keeping models resident (`--resident` — measured slower from memory pressure), and `torch.compile` (inductor is ~2× slower than eager on MPS in the current PyTorch).
-
-### Memory
-
-Phase-level profiling (`tools/profile_memory.py`, one M-series/32GB machine, `512` pipeline, default settings) found the peak isn't where we expected:
-
-| Phase | Peak process RSS |
-|---|---|
-| **Pipeline load** | **~12-14GB (the actual peak)** |
-| Structure/shape/tex sampling | well under 1GB above baseline |
-| Decode + texture bake | ~3GB |
-
-The peak occurs during **loading**, not during sampling or baking — checkpoint construction and dtype casting transiently need more memory than the pipeline settles into afterward. This also means process RSS (what actually determines whether a machine can run this at all) and PyTorch's MPS-only counters (`driver_allocated_memory`) disagree substantially: the MPS-only view puts the peak at ~9.4GB during texture baking, missing the larger, CPU-side loading spike entirely — because `low_vram` mode keeps not-yet-active submodels resident on the CPU side, and on unified memory that counts against the same budget even though it never touches the MPS device counters. If you're profiling this pipeline yourself, measure process RSS, not just MPS allocator stats.
-
-Practical implication: the ~12-14GB measured peak is comfortably under 24GB, and even a 16GB machine may have enough headroom depending on what else is running — this project hasn't been validated on 16GB hardware, but the earlier "peaks around 18GB" estimate look pessimistic in light of this measurement. `CFG_BATCH=0` (sequential CFG) measurably lowers memory *during sampling* (~5.8GB vs ~6.5GB driver-side) but doesn't change the global peak, since that's set during loading regardless of sampling settings.
-
-The first-ever run also downloads ~15GB of HuggingFace weights (TRELLIS.2, DINOv3, RMBG-2.0), which is network-bound and not counted above.
-
-> **Thermal note.** Apple Silicon throttles aggressively under sustained load. The *same* run can take several times longer when the machine has already been hot for a while — nothing in the code path changes. If a run is unexpectedly slow, let the machine cool for a few minutes and retry before blaming the code. All numbers above assume a cool machine.
-
-## Limitations
-
-- **Hole filling disabled.** Decode-time hole filling needs `cumesh`, whose Metal port segfaults on decoder-sized meshes, so it is skipped. Output meshes may have small holes.
-- **Attention is not fused.** Dense (structure-phase) attention runs through a naive unfused implementation — measured 3.3-3.9× *faster* than PyTorch's fused MPS SDPA at these shapes — and sparse attention through padded SDPA. Roofline analysis bounds what a hand-written flash-style Metal kernel could add on top at ~6% end-to-end, which we judged not worth the engineering cost. A fused *varlen/sparse* kernel would not help at all: single-image inference is batch-1 with zero padding waste.
-- **Pre-simplified before bake.** By default the mesh is decimated to ~200K faces before Metal BVH construction. Raise the cap with `BAKE_MAX_FACES` (see [Maximum quality](#maximum-quality)) or pass `--obj` for the full-resolution mesh (written before simplification).
-- **Inference only.** No training support.
-
-## Development
-
-- `tools/profile_attn.py` — instrumented profiling harness for MPS bottlenecks (attention share, CPU fallbacks, per-phase breakdown).
-- `tools/bench/` — the benchmark and numerical-sanity scripts behind the optimization campaign (CFG-batching bit-exactness, skip-init verification, load-time splits, the step-comparison renderer).
-
-The package is a standard src-layout project; `uv pip install -e .` gives you the three console scripts and importable `trellis_silicon` package. Set `TRELLIS2_ROOT` to point the patcher/runtime at a non-standard TRELLIS.2 location.
-
-Reproducibility and CI:
-
-- `requirements.lock` pins the exact dependency versions the verification baseline was established with; `setup.sh` installs from it. Upgrading a dependency can shift floating-point behavior (and therefore the deterministic output mesh) even at the same PyTorch version — re-verify after any upgrade.
-- `setup.sh` clones TRELLIS.2 at a pinned upstream commit (the one the patches were validated against). Set `TRELLIS2_COMMIT=<sha>` (or `HEAD`) to override.
-- `tests/` holds the unit suite (`pytest tests/`), including bit-exactness tests that pin the vectorized mesh extraction against the original dict-based implementation. CI (GitHub Actions, Apple Silicon runners) runs lint, the unit suite, and a patcher idempotency check against the pinned TRELLIS.2 — no model weights involved.
-
-## License
-
-The code in this repository (backends, patches, package, scripts) is released under the MIT License. Upstream model weights carry their own licenses:
-
-- **TRELLIS.2** — [MIT License](https://github.com/microsoft/TRELLIS.2/blob/main/LICENSE)
-- **DINOv3** — [Meta custom license](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m/blob/main/LICENSE.md) (gated; review before commercial use)
-- **RMBG-2.0** — [CC BY-NC 4.0](https://huggingface.co/briaai/RMBG-2.0) (non-commercial; commercial use requires a license from BRIA)
-
-## References
-
-- [trellis-mac](https://github.com/shivampkumar/trellis-mac) by Shivam P Kumar — the direct upstream this project builds on; the original CUDA-to-Apple-Silicon (MPS) port of TRELLIS.2
-- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) by Microsoft Research — the original model and codebase
-- [@pedronaugusto](https://github.com/pedronaugusto)'s Metal stack — [`mtldiffrast`](https://github.com/pedronaugusto/mtldiffrast), [`mtlbvh`](https://github.com/pedronaugusto/mtlbvh), [`mtlmesh`](https://github.com/pedronaugusto/mtlmesh), [`mtlgemm`](https://github.com/pedronaugusto/mtlgemm), and the [`trellis2-apple`](https://github.com/pedronaugusto/trellis2-apple) CPU fork of `o_voxel` — the Metal texture-baking and sparse-conv path
-- [DINOv3](https://github.com/facebookresearch/dinov3) by Meta — image feature extraction
-- [RMBG-2.0](https://github.com/Bria-AI/RMBG-2.0) by BRIA AI — background removal
+Bu çalışma [Sanchez Kim / trellis-silicon](https://github.com/sanchez-kim/trellis-silicon), [Shivam P Kumar / trellis-mac](https://github.com/shivampkumar/trellis-mac), Microsoft Research'ün TRELLIS.2 modeli ve [Pedro Naugusto'nun Metal araçları](https://github.com/pedronaugusto) üzerine kuruludur. Kaynak README'deki Brighella örneği [The Metropolitan Museum of Art koleksiyonundan](https://www.metmuseum.org/art/collection/search/201769) alınmış kamu malı (CC0) görseldir.

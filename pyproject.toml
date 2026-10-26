@@ -46,7 +46,7 @@ trellis-silicon-web = "trellis_silicon.webui:main"
 trellis-silicon-patch = "trellis_silicon.patches:main"
 
 [project.urls]
-Homepage = "https://github.com/sanchez-kim/trellis-silicon"
+Upstream = "https://github.com/sanchez-kim/trellis-silicon"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trellis_silicon"]
